@@ -1,4 +1,4 @@
-l#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Vercel Python (ASGI/Starlette) - VLESS + Trojan + VMess AEAD over WebSocket
 Deploy target: api/index.py
