@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "regions": ["sin1"],
+  "builds": [
+    {
+      "src": "index.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb",
+        "maxDuration": 300
+      }
+    }
+  ],
+  "routes": [
+    { "src": "/(.*)", "dest": "index.py" }
+  ],
+  "functions": {
+    "api/index.py": {
+      "maxDuration": 300,
+      "memory": 1024
+    }
+  }
+}
