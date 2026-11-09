@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Vercel Python (ASGI/Starlette) - VLESS + Trojan + VMess AEAD over WebSocket
+Generate config TLS (443) + NON-TLS (80) untuk tiap protokol.
 """
 
 import os
@@ -34,6 +35,12 @@ NAME = os.environ.get('NAME', 'Vercel-Node')
 PORT = int(os.environ.get('PORT', 3000))
 SHOW_LOG = bool(os.environ.get('SHOW_LOG'))
 ALLOW_ANY_UUID = os.environ.get('ALLOW_ANY_UUID', 'true').lower() in ('1', 'true', 'yes')
+
+# Opsional: paksa SNI / WS Host berbeda dari hostname yang dideteksi
+# (misal di belakang Cloudflare: SERVER_ADDR=IP, WS_HOST=domain, WS_SNI=domain)
+SERVER_ADDR = os.environ.get('SERVER_ADDR', '').strip()
+WS_HOST     = os.environ.get('WS_HOST', '').strip()
+WS_SNI      = os.environ.get('WS_SNI', '').strip()
 
 def log(*a):
     if SHOW_LOG: print(*a, flush=True)
@@ -598,22 +605,71 @@ async def ws_endpoint(ws: WebSocket):
         try: await ws.close()
         except Exception: pass
 
-# ==================== HTTP Endpoints ====================
+# ==================== Subscription Builder (NEW) ====================
 async def build_subscription(request):
+    """
+    Generate 6 config:
+      VLESS  TLS(443) + NTLS(80)
+      Trojan TLS(443) + NTLS(80)
+      VMess  TLS(443) + NTLS(80)
+    """
     isp = await get_isp()
     domain, _, _ = get_endpoint_info(request)
     name_part = f"{NAME}-{isp}" if NAME else isp
-    vless = (f"vless://{UUID}@{domain}:443?path=%2Fvless&security=tls"
-             f"&encryption=none&host={domain}&fp=chrome&type=ws&sni={domain}#{name_part}-VLESS")
-    trojan = (f"trojan://{UUID}@{domain}:443?path=%2Ftrojan&security=tls"
-              f"&host={domain}&fp=chrome&type=ws&sni={domain}#{name_part}-Trojan")
-    vmess_cfg = {
-        'v':'2','ps':f'{name_part}-VMess','add':domain,'port':'443','id':UUID,'aid':'0',
-        'scy':'auto','net':'ws','type':'none','host':domain,'path':'/vmess',
-        'tls':'tls','sni':domain,'alpn':'','fp':'chrome',
+
+    # Gunakan override env kalau ada (mis. di belakang CDN)
+    add_host = SERVER_ADDR or domain
+    ws_host  = WS_HOST or domain
+    ws_sni   = WS_SNI  or ws_host
+
+    lines = []
+
+    # ============ VLESS ============
+    lines.append(
+        f"vless://{UUID}@{add_host}:443?path=%2Fvless&security=tls"
+        f"&encryption=none&host={ws_host}&fp=chrome&type=ws&sni={ws_sni}"
+        f"#{name_part}-VLESS-TLS"
+    )
+    lines.append(
+        f"vless://{UUID}@{add_host}:80?path=%2Fvless&security=none"
+        f"&encryption=none&host={ws_host}&type=ws"
+        f"#{name_part}-VLESS-NTLS"
+    )
+
+    # ============ TROJAN ============
+    lines.append(
+        f"trojan://{UUID}@{add_host}:443?path=%2Ftrojan&security=tls"
+        f"&host={ws_host}&fp=chrome&type=ws&sni={ws_sni}"
+        f"#{name_part}-Trojan-TLS"
+    )
+    lines.append(
+        f"trojan://{UUID}@{add_host}:80?path=%2Ftrojan&security=none"
+        f"&host={ws_host}&type=ws"
+        f"#{name_part}-Trojan-NTLS"
+    )
+
+    # ============ VMESS ============
+    vmess_tls = {
+        'v': '2', 'ps': f'{name_part}-VMess-TLS',
+        'add': add_host, 'port': '443', 'id': UUID, 'aid': '0',
+        'scy': 'auto', 'net': 'ws', 'type': 'none',
+        'host': ws_host, 'path': '/vmess',
+        'tls': 'tls', 'sni': ws_sni, 'alpn': '', 'fp': 'chrome',
     }
-    vmess = 'vmess://' + base64.b64encode(json.dumps(vmess_cfg, separators=(',', ':')).encode()).decode()
-    return '\n'.join([vless, trojan, vmess])
+    lines.append('vmess://' + base64.b64encode(
+        json.dumps(vmess_tls, separators=(',', ':')).encode()).decode())
+
+    vmess_ntls = {
+        'v': '2', 'ps': f'{name_part}-VMess-NTLS',
+        'add': add_host, 'port': '80', 'id': UUID, 'aid': '0',
+        'scy': 'auto', 'net': 'ws', 'type': 'none',
+        'host': ws_host, 'path': '/vmess',
+        'tls': 'none', 'sni': '', 'alpn': '', 'fp': '',
+    }
+    lines.append('vmess://' + base64.b64encode(
+        json.dumps(vmess_ntls, separators=(',', ':')).encode()).decode())
+
+    return '\n'.join(lines)
 
 async def sub_endpoint(request):
     try:
@@ -626,17 +682,14 @@ async def sub_endpoint(request):
 
 # ============ Serve index.html untuk "/" ============
 def _find_index_html():
-    """Cari index.html di beberapa lokasi umum (lokal & Vercel Lambda)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
+    for p in [
         os.path.join(here, 'index.html'),
         os.path.join('/var/task', 'index.html'),
         os.path.join(here, '..', 'index.html'),
         os.path.join(os.getcwd(), 'index.html'),
-    ]
-    for p in candidates:
-        if os.path.isfile(p):
-            return p
+    ]:
+        if os.path.isfile(p): return p
     return None
 
 async def index_endpoint(request):
@@ -644,16 +697,13 @@ async def index_endpoint(request):
     if path:
         try:
             with open(path, 'r', encoding='utf-8') as f:
-                html = f.read()
-            return HTMLResponse(html, headers={'Cache-Control': 'no-cache'})
+                return HTMLResponse(f.read(), headers={'Cache-Control': 'no-cache'})
         except Exception as e:
             log_err(f'[INDEX READ] {path}: {e}')
-    # Fallback kalau index.html tidak ketemu
     return HTMLResponse(
         '<!DOCTYPE html><html><body style="font-family:sans-serif;background:#0f1115;'
         'color:#e6e6e6;padding:40px"><h1>Node Proxy Aktif</h1>'
-        '<p>index.html tidak ditemukan. Subscription: <a style="color:#7dd3fc" '
-        'href="/vercel">/vercel</a></p></body></html>'
+        '<p>Subscription: <a style="color:#7dd3fc" href="/vercel">/vercel</a></p></body></html>'
     )
 
 async def health_endpoint(request):
@@ -673,21 +723,21 @@ async def health_endpoint(request):
         'uuid': UUID,
         'uuid_mode': 'ANY' if ALLOW_ANY_UUID else 'ENV_ONLY',
         'sub_path': SUB_PATH,
+        'server_addr_override': SERVER_ADDR or None,
+        'ws_host_override': WS_HOST or None,
+        'ws_sni_override': WS_SNI or None,
     }
     return Response(json.dumps(info, indent=2), media_type='application/json')
 
 # ==================== App ====================
 routes = [
-    # WebSocket
     WebSocketRoute('/vless',  ws_endpoint),
     WebSocketRoute('/trojan', ws_endpoint),
     WebSocketRoute('/vmess',  ws_endpoint),
-    # HTTP
     Route(f'/{SUB_PATH}', sub_endpoint),
     Route('/vercel', sub_endpoint),
     Route('/sub',    sub_endpoint),
     Route('/health', health_endpoint),
-    # "/" → index.html
     Route('/',       index_endpoint),
     Route('/index.html', index_endpoint),
 ]
