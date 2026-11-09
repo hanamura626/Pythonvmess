@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Vercel Python (ASGI/Starlette) - VLESS + Trojan + VMess AEAD over WebSocket
-Deploy target: api/index.py
 """
 
 import os
@@ -15,6 +14,8 @@ import hashlib
 import secrets
 import socket
 import zlib
+import re
+import asyncio
 from urllib.parse import quote
 
 import httpx
@@ -32,8 +33,6 @@ SUB_PATH = os.environ.get('SUB_PATH', 'vercel')
 NAME = os.environ.get('NAME', 'Vercel-Node')
 PORT = int(os.environ.get('PORT', 3000))
 SHOW_LOG = bool(os.environ.get('SHOW_LOG'))
-
-# true = terima UUID random untuk VLESS/Trojan (+ UUID env)
 ALLOW_ANY_UUID = os.environ.get('ALLOW_ANY_UUID', 'true').lower() in ('1', 'true', 'yes')
 
 def log(*a):
@@ -47,7 +46,6 @@ BLOCKED_DOMAINS = [
     'speedtest.net', 'fast.com', 'speedtest.cn', 'speed.cloudflare.com', 'speedof.me',
     'testmy.net', 'bandwidth.place', 'speed.io', 'librespeed.org', 'speedcheck.org'
 ]
-import re
 IPV4_REGEX = re.compile(
     r'^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}'
     r'(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
@@ -412,7 +410,6 @@ def get_http():
 async def resolve_host(host):
     if IPV4_REGEX.match(host): return host
     try:
-        import asyncio
         loop = asyncio.get_event_loop()
         info = await asyncio.wait_for(loop.getaddrinfo(host, None, family=socket.AF_INET), timeout=4)
         if info: return info[0][4][0]
@@ -465,7 +462,7 @@ async def _ws_to_tcp(ws, reader, writer, decoder=None):
                 writer.write(data)
             await writer.drain()
     except Exception as e:
-        log_err(f'[WS→TCP] {e}')
+        log_err(f'[WS->TCP] {e}')
 
 async def _tcp_to_ws(ws, reader, writer, encoder=None):
     try:
@@ -475,10 +472,9 @@ async def _tcp_to_ws(ws, reader, writer, encoder=None):
             payload = encoder.encode(data) if encoder else data
             if payload: await ws.send_bytes(payload)
     except Exception as e:
-        log_err(f'[TCP→WS] {e}')
+        log_err(f'[TCP->WS] {e}')
 
 async def bridge(ws, reader, writer, decoder=None, encoder=None):
-    import asyncio
     t1 = asyncio.create_task(_ws_to_tcp(ws, reader, writer, decoder))
     t2 = asyncio.create_task(_tcp_to_ws(ws, reader, writer, encoder))
     try:
@@ -514,7 +510,6 @@ async def handle_vless(ws, msg):
     try: await ws.send_bytes(bytes([version, 0]))
     except Exception: return False
     target = await resolve_host(host)
-    import asyncio
     try: reader, writer = await asyncio.open_connection(target, port)
     except Exception: return False
     if i < len(msg):
@@ -551,7 +546,6 @@ async def handle_trojan(ws, msg):
     if off + 1 < len(msg) and msg[off] == 0x0d and msg[off+1] == 0x0a: off += 2
     if is_blocked_domain(host): return False
     target = await resolve_host(host)
-    import asyncio
     try: reader, writer = await asyncio.open_connection(target, port)
     except Exception: return False
     if off < len(msg):
@@ -571,14 +565,13 @@ async def handle_vmess(ws, msg):
     try: await ws.send_bytes(encode_vmess_response_header(header))
     except Exception: return False
     target = await resolve_host(header['address'])
-    import asyncio
     try: reader, writer = await asyncio.open_connection(target, header['port'])
     except Exception: return False
     if remainder:
         try:
             for plain in decoder.push(remainder): writer.write(plain)
             await writer.drain()
-        except Exception: 
+        except Exception:
             try: writer.close()
             except Exception: pass
             return False
@@ -631,24 +624,71 @@ async def sub_endpoint(request):
         log_err(f'[SUB] {e}')
         return PlainTextResponse('Internal Server Error\n', status_code=500)
 
+# ============ Serve index.html untuk "/" ============
+def _find_index_html():
+    """Cari index.html di beberapa lokasi umum (lokal & Vercel Lambda)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, 'index.html'),
+        os.path.join('/var/task', 'index.html'),
+        os.path.join(here, '..', 'index.html'),
+        os.path.join(os.getcwd(), 'index.html'),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
+
 async def index_endpoint(request):
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        idx = os.path.join(here, '..', 'index.html')
-        with open(idx, 'r', encoding='utf-8') as f:
-            return HTMLResponse(f.read())
-    except FileNotFoundError:
-        return HTMLResponse('<h3>Node Proxy UI Running. Subscriptions ready at /vercel</h3>')
+    path = _find_index_html()
+    if path:
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                html = f.read()
+            return HTMLResponse(html, headers={'Cache-Control': 'no-cache'})
+        except Exception as e:
+            log_err(f'[INDEX READ] {path}: {e}')
+    # Fallback kalau index.html tidak ketemu
+    return HTMLResponse(
+        '<!DOCTYPE html><html><body style="font-family:sans-serif;background:#0f1115;'
+        'color:#e6e6e6;padding:40px"><h1>Node Proxy Aktif</h1>'
+        '<p>index.html tidak ditemukan. Subscription: <a style="color:#7dd3fc" '
+        'href="/vercel">/vercel</a></p></body></html>'
+    )
+
+async def health_endpoint(request):
+    here = os.path.dirname(os.path.abspath(__file__))
+    def ls(p):
+        try: return sorted(os.listdir(p))
+        except Exception as e: return f'ERR: {e}'
+    info = {
+        'ok': True,
+        'python': sys.version,
+        'cwd': os.getcwd(),
+        'file': os.path.abspath(__file__),
+        'here': here,
+        'listdir_here': ls(here),
+        'listdir_var_task': ls('/var/task'),
+        'index_html_path': _find_index_html(),
+        'uuid': UUID,
+        'uuid_mode': 'ANY' if ALLOW_ANY_UUID else 'ENV_ONLY',
+        'sub_path': SUB_PATH,
+    }
+    return Response(json.dumps(info, indent=2), media_type='application/json')
 
 # ==================== App ====================
 routes = [
-    WebSocketRoute('/vless', ws_endpoint),
+    # WebSocket
+    WebSocketRoute('/vless',  ws_endpoint),
     WebSocketRoute('/trojan', ws_endpoint),
-    WebSocketRoute('/vmess', ws_endpoint),
+    WebSocketRoute('/vmess',  ws_endpoint),
+    # HTTP
     Route(f'/{SUB_PATH}', sub_endpoint),
     Route('/vercel', sub_endpoint),
-    Route('/sub', sub_endpoint),
-    Route('/', index_endpoint),
+    Route('/sub',    sub_endpoint),
+    Route('/health', health_endpoint),
+    # "/" → index.html
+    Route('/',       index_endpoint),
     Route('/index.html', index_endpoint),
 ]
 app = Starlette(routes=routes)
